@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+env/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Project
+data/
+outputs/
+models/
+*.pth
+*.pt
+*.h5
+*.ckpt
+*.log
