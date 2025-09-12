@@ -1,0 +1,11 @@
+{
+  "in_dim": 9,
+  "use_params": true,
+  "target_delta": true,
+  "loss": "huber",
+  "train_loss_last": 0.0002406338864072625,
+  "val_loss_best": 0.0004914501179009676,
+  "r2_all": 0.998951967461804,
+  "r2_elastic": 0.999441442110902,
+  "r2_plastic": 0.9988693779282208
+}
