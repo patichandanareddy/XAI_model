@@ -1,0 +1,52 @@
+{
+  "feature_names": [
+    "strain",
+    "prev_strain",
+    "prev_stress",
+    "e_plastic",
+    "prev_e_plastic",
+    "control",
+    "E",
+    "sig0",
+    "H_kin"
+  ],
+  "base_r2": -69169.25,
+  "base_r2_perm_call": -69169.25,
+  "permutation_importance": {
+    "strain": 127187164.08333333,
+    "prev_strain": 9063116.416666666,
+    "prev_stress": 12633294.75,
+    "e_plastic": 12830141.083333334,
+    "prev_e_plastic": 994068.125,
+    "control": -5541.342447916664,
+    "E": 0.0,
+    "sig0": 0.0,
+    "H_kin": 0.0
+  },
+  "saliency": {
+    "strain": 82.74638366699219,
+    "prev_strain": 25.8729248046875,
+    "prev_stress": 27.931293487548828,
+    "e_plastic": 27.810583114624023,
+    "prev_e_plastic": 17.509933471679688,
+    "control": 1.1299774646759033,
+    "E": 2.9233715534210205,
+    "sig0": 9.712738037109375,
+    "H_kin": 3.2865264415740967
+  },
+  "integrated_gradients": {
+    "strain": 81.28590393066406,
+    "prev_strain": 25.59043312072754,
+    "prev_stress": 27.46877670288086,
+    "e_plastic": 27.274120330810547,
+    "prev_e_plastic": 18.710569381713867,
+    "control": 1.166992425918579,
+    "E": 2.5883965492248535,
+    "sig0": 8.635150909423828,
+    "H_kin": 2.4062674045562744
+  },
+  "standardized": true,
+  "use_params": true,
+  "target_delta": true,
+  "n_samples": 300000
+}
