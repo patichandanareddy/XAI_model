@@ -1,0 +1,36 @@
+{
+  "feature_names": [
+    "strain",
+    "prev_strain",
+    "prev_stress",
+    "time",
+    "control"
+  ],
+  "base_r2": 0.7308814525604248,
+  "base_r2_perm_call": 0.7308814525604248,
+  "permutation_importance": {
+    "strain": 18095.11434499423,
+    "prev_strain": 20893.687261660893,
+    "prev_stress": 266.3833472728729,
+    "time": 0.0,
+    "control": -0.0017705957094827918
+  },
+  "saliency": {
+    "strain": 0.5069506168365479,
+    "prev_strain": 0.3750804364681244,
+    "prev_stress": 0.1277821660041809,
+    "time": 0.11373405158519745,
+    "control": 0.006112303584814072
+  },
+  "integrated_gradients": {
+    "strain": 0.4676818251609802,
+    "prev_strain": 0.34804874658584595,
+    "prev_stress": 0.14033642411231995,
+    "time": 0.08535587042570114,
+    "control": 0.006094210781157017
+  },
+  "standardized": true,
+  "use_params": true,
+  "target_delta": true,
+  "n_samples": 300000
+}

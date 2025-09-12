@@ -1,0 +1,15 @@
+{
+  "in_dim": 5,
+  "target_delta": true,
+  "loss": "huber",
+  "train_loss_last": 3.5466830799123273e-06,
+  "val_loss_best": 1.3945709247491322e-05,
+  "r2_all": 0.9999721646308899,
+  "feature_names": [
+    "strain",
+    "prev_strain",
+    "prev_stress",
+    "time",
+    "control"
+  ]
+}
