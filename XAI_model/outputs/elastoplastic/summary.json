@@ -1,6 +1,6 @@
 {
-  "train_loss_last": 5.7746210377663375e-05,
-  "val_loss_last": 5.594367507612333e-05,
-  "best_val_loss": 5.594367507612333e-05,
-  "epochs_ran": 50
+  "train_loss_last": 4.0993646520655605e-06,
+  "val_loss_last": 4.37919923349303e-06,
+  "best_val_loss": 4.149607936948693e-06,
+  "epochs_ran": 120
 }
