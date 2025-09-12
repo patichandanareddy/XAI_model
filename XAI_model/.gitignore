@@ -19,3 +19,4 @@ models/
 *.h5
 *.ckpt
 *.log
+../*
