@@ -1,359 +1,338 @@
-import os, glob, argparse, json
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse
+import os
+import json
+import glob
+from typing import List, Tuple, Dict
+
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset
+from tqdm import tqdm
 import matplotlib
-matplotlib.use("Agg")
+matplotlib.use("Agg")  # headless
 import matplotlib.pyplot as plt
+from sklearn.metrics import r2_score
 
-# ---------------------------
-# Dataset (matches training)
-# ---------------------------
-FEATURE_ORDER = [
-    "strain",
-    "prev_strain",
-    "prev_stress",
-    "e_plastic",
-    "prev_e_plastic",
-    "control",
-    "E",
-    "sig0",
-    "H_kin",
-]
-TARGET_KEY = "stress"
 
-def _safe_get_len(d):
-    for k, v in d.items():
-        if isinstance(v, np.ndarray) and v.ndim == 1 and v.size > 1:
-            return v.shape[0]
-    return 0
+# ----------------------------
+# Feature configuration
+# ----------------------------
+FEATURES6 = ['strain', 'prev_strain', 'prev_stress',
+             'e_plastic', 'prev_e_plastic', 'control']
+PARAMS3   = ['E', 'sig0', 'H_kin']  # optional material params
 
-def _broadcast_scalar(arr, T):
-    if np.ndim(arr) == 0:
-        return np.full((T,), float(arr), dtype=np.float64)
-    if np.ndim(arr) == 1 and arr.size == 1:
-        return np.full((T,), float(arr[0]), dtype=np.float64)
-    return arr
 
-def build_xy_from_dict(d):
-    T = _safe_get_len(d)
-    xs, used = [], []
-    for name in FEATURE_ORDER:
-        if name not in d:
-            continue
-        arr = d[name]
-        if isinstance(arr, np.ndarray):
-            arr = _broadcast_scalar(arr, T)
-            if arr.ndim == 1:
-                xs.append(arr.reshape(T, 1))
-                used.append(name)
-    X = np.concatenate(xs, axis=1) if xs else np.zeros((T,0), dtype=np.float64)
-    if TARGET_KEY in d and isinstance(d[TARGET_KEY], np.ndarray):
-        y = d[TARGET_KEY].reshape(-1).astype(np.float64)
-    else:
-        y = np.zeros((T,), dtype=np.float64)
-    return X.astype(np.float32), y.astype(np.float32), used
+# ----------------------------
+# Data loading helpers
+# ----------------------------
+def load_one_npy(path: str) -> dict:
+    d = np.load(path, allow_pickle=True)
+    # Support .npy dict saved as 0-d array, or .npz files
+    if isinstance(d, np.ndarray) and d.shape == ():
+        d = d.item()
+    elif isinstance(d, np.lib.npyio.NpzFile):
+        d = dict(d.items())
+    return d
 
-class ElastoExplainDS(Dataset):
-    def __init__(self, files, standardize=False, limit=None):
-        self.files = files if limit is None else files[:limit]
-        Xs, Ys = [], []
-        used_names = None
-        for f in self.files:
-            d = np.load(f, allow_pickle=True).item()
-            X, y, used = build_xy_from_dict(d)
-            if X.shape[0] == 0 or X.shape[1] == 0:
-                continue
-            Xs.append(X)
-            Ys.append(y.reshape(-1,1))
-            if used_names is None:
-                used_names = used
-        self.X = np.concatenate(Xs, axis=0) if Xs else np.zeros((0, len(FEATURE_ORDER)), dtype=np.float32)
-        self.Y = np.concatenate(Ys, axis=0) if Ys else np.zeros((0,1), dtype=np.float32)
-        self.feature_names = used_names if used_names is not None else FEATURE_ORDER
-        self.standardize = standardize
-        if standardize and self.X.shape[0] > 0:
-            self.mean = self.X.mean(axis=0, keepdims=True)
-            self.std = self.X.std(axis=0, keepdims=True) + 1e-8
-            self.X = (self.X - self.mean) / self.std
-        else:
-            self.mean = None
-            self.std = None
 
-    def __len__(self):
-        return self.X.shape[0]
+def build_xy(d: dict, use_params: bool, target_delta: bool) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    feats = FEATURES6.copy()
+    if use_params:
+        feats += PARAMS3
 
-    def __getitem__(self, idx):
-        return (
-            torch.from_numpy(self.X[idx]),
-            torch.from_numpy(self.Y[idx])
-        )
+    X_cols = []
+    N = len(d['strain'])
+    for k in feats:
+        v = d[k]
+        # allow scalars for E/sig0/H_kin
+        if np.ndim(v) == 0:
+            v = np.full((N,), float(v), dtype=np.float32)
+        X_cols.append(np.asarray(v, dtype=np.float32).reshape(-1, 1))
 
-# ---------------------------
-# Model utilities
-# ---------------------------
+    X = np.concatenate(X_cols, axis=1).astype(np.float32)
 
-class Wrapper(nn.Module):
-    """Holds a .net nn.Sequential to match checkpoint prefix (e.g., 'net.0.weight')."""
-    def __init__(self, net: nn.Sequential):
-        super().__init__()
-        self.net = net
-    def forward(self, x):
-        return self.net(x)
+    y = np.asarray(d['stress'], dtype=np.float32).reshape(-1, 1)
+    if target_delta:
+        prev = np.asarray(d['prev_stress'], dtype=np.float32).reshape(-1, 1)
+        y = y - prev
 
-def build_net_from_state_dict(sd: dict) -> nn.Sequential:
+    return X, y, feats
+
+
+def load_dataset(
+    data_dir: str,
+    max_files: int,
+    limit: int,
+    use_params: bool,
+    target_delta: bool
+) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    files = sorted(glob.glob(os.path.join(data_dir, 'INPUTS', 'npy', 'sample_*.npy')))
+    if not files:
+        raise FileNotFoundError(f'No files under {data_dir}/INPUTS/npy/sample_*.npy')
+    if max_files is not None:
+        files = files[:max_files]
+
+    Xs, Ys = [], []
+    feats_ref: List[str] = None
+    total = 0
+
+    for f in tqdm(files, desc='[Load]'):
+        d = load_one_npy(f)
+        X, y, feats = build_xy(d, use_params, target_delta)
+        if feats_ref is None:
+            feats_ref = feats
+        Xs.append(X)
+        Ys.append(y)
+        total += len(X)
+        if limit is not None and total >= limit:
+            break
+
+    X = np.concatenate(Xs, axis=0)
+    y = np.concatenate(Ys, axis=0)
+    if limit is not None and len(X) > limit:
+        X = X[:limit]
+        y = y[:limit]
+
+    return X, y, feats_ref
+
+
+# ----------------------------
+# Standardization helpers
+# ----------------------------
+def standardize_fit(X: np.ndarray):
+    mean = X.mean(axis=0, keepdims=True)
+    std  = X.std(axis=0, keepdims=True) + 1e-8
+    return mean, std
+
+def standardize_apply(X: np.ndarray, mean: np.ndarray, std: np.ndarray):
+    return (X - mean) / std
+
+
+# ----------------------------
+# Model loading (shape-/key-agnostic)
+# ----------------------------
+def _normalize_state_dict_keys(sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Strip common wrappers like 'module.' and 'net.' from state_dict keys."""
+    new_sd = {}
+    for k, v in sd.items():
+        k2 = k
+        if k2.startswith("module."):
+            k2 = k2[len("module."):]
+        if k2.startswith("net."):
+            k2 = k2[len("net."):]
+        new_sd[k2] = v
+    return new_sd
+
+
+def infer_mlp_from_state_dict(sd: Dict[str, torch.Tensor]) -> nn.Module:
     """
-    Rebuild nn.Sequential with Linear/ReLU at the exact indices the checkpoint used.
-    Expects keys like 'net.0.weight', 'net.2.weight', ... (Linear at even, ReLU at odd).
+    Infer a plain MLP (Sequential of Linear/ReLU.../Linear) from linear weight shapes
+    and load the (normalized) state_dict into it.
     """
-    # collect all (pos, weight) for keys ending with '.weight' under the same top-level module (prefix)
-    linear_keys = [k for k in sd.keys() if k.endswith(".weight")]
-    if not linear_keys:
-        raise RuntimeError("No linear weights found in state_dict.")
-    # detect the common prefix (e.g., 'net')
-    first_key = linear_keys[0]
-    prefix = first_key.split('.')[0]  # 'net'
-    # positions for Linear layers (e.g., 0,2,4,6)
-    positions = []
-    shapes = {}
-    for k in linear_keys:
-        parts = k.split('.')
-        if parts[0] != prefix:
-            continue
-        try:
-            pos = int(parts[1])
-        except ValueError:
-            continue
-        positions.append(pos)
-        shapes[pos] = tuple(sd[k].shape)  # (out, in)
+    sd = _normalize_state_dict_keys(sd)
 
-    if not positions:
-        raise RuntimeError("Could not parse layer indices from state_dict.")
-    max_pos = max(positions)
+    # Collect linear layers in order (keys like "0.weight", "2.weight", ...)
+    items = [(k, v) for k, v in sd.items() if k.endswith(".weight") and v.ndim == 2]
+    if not items:
+        raise RuntimeError("No linear layer weights found in the state_dict.")
 
-    # construct layers list of length max_pos+1
-    layers = []
-    for idx in range(max_pos + 1):
-        if idx in positions:
-            out_dim, in_dim = shapes[idx]
-            layers.append(nn.Linear(in_dim, out_dim))
-        else:
-            # fill gaps (typical checkpoints had ReLU at odd indices)
-            layers.append(nn.ReLU())
+    def _layer_index(name: str) -> int:
+        # Extract the first numeric component from names like "0.weight", "2.bias"
+        for part in name.split("."):
+            if part.isdigit():
+                return int(part)
+        return 10_000
 
-    return nn.Sequential(*layers)
+    items.sort(key=lambda kv: _layer_index(kv[0]))
+    shapes = [w.shape for _, w in items]
+    in_dim = shapes[0][1]
+    hidden = [s[0] for s in shapes[:-1]]
+    out_dim = shapes[-1][0]
 
-def try_load_model(model_path: str):
-    """
-    Load:
-      1) Full saved nn.Module (if any)
-      2) state_dict -> reconstruct .net architecture from indices/shapes
-    """
-    # Attempt 1: load complete module
-    try:
-        obj = torch.load(model_path, map_location="cpu")
-        if isinstance(obj, nn.Module):
-            obj.eval()
-            return obj
-    except Exception:
-        pass
+    layers: List[nn.Module] = []
+    cur_in = in_dim
+    for h in hidden:
+        layers += [nn.Linear(cur_in, h), nn.ReLU()]
+        cur_in = h
+    layers += [nn.Linear(cur_in, out_dim)]
 
-    # Attempt 2: state_dict
-    sd = torch.load(model_path, map_location="cpu")
-    if not isinstance(sd, dict):
-        raise RuntimeError("Checkpoint is not a state_dict and is not a Module.")
-    # Rebuild net to match indices/sizes in state_dict
-    net = build_net_from_state_dict(sd)
-    model = Wrapper(net)
-    # Load weights with strict=True (names should match 'net.X.weight/bias')
-    missing, unexpected = model.load_state_dict(sd, strict=False)
-    # strict=False in case checkpoint had buffers/extra keys; warn if truly empty
-    if all(len(x)==0 for x in (missing, unexpected)) is False:
-        # Not a failure; just proceed
-        pass
-    model.eval()
+    model = nn.Sequential(*layers)
+
+    # make sure keys are normalized to match the Sequential indices
+    sd = _normalize_state_dict_keys(sd)
+    model.load_state_dict(sd, strict=True)
     return model
 
-# ---------------------------
-# Explainability
-# ---------------------------
 
+def try_load_model(path: str) -> nn.Module:
+    obj = torch.load(path, map_location="cpu")
+    if isinstance(obj, dict) and "state_dict" in obj:
+        sd = obj["state_dict"]
+    elif isinstance(obj, dict):
+        sd = obj
+    else:
+        raise RuntimeError("Unsupported checkpoint format.")
+    sd = _normalize_state_dict_keys(sd)
+    return infer_mlp_from_state_dict(sd)
+
+
+# ----------------------------
+# Explainability methods
+# ----------------------------
 @torch.no_grad()
-def r2_score(y_true, y_pred):
-    y_true = y_true.reshape(-1)
-    y_pred = y_pred.reshape(-1)
-    ss_res = np.sum((y_true - y_pred)**2)
-    ss_tot = np.sum((y_true - np.mean(y_true))**2) + 1e-12
-    return 1.0 - ss_res/ss_tot
+def perm_importance(model: nn.Module, X: torch.Tensor, y: torch.Tensor, repeats=3, batch=4096):
+    model.eval()
 
-def predict_batches(model, X, batch=8192):
-    device = torch.device("cpu")
-    yh = []
-    for i in range(0, X.shape[0], batch):
-        xb = torch.from_numpy(X[i:i+batch]).to(device)
-        pb = model(xb).detach().cpu().numpy().reshape(-1)
-        yh.append(pb)
-    return np.concatenate(yh, axis=0)
+    def _predict_batches(Xt: torch.Tensor) -> np.ndarray:
+        preds = []
+        for i in range(0, len(Xt), batch):
+            preds.append(model(Xt[i:i+batch]))
+        return torch.cat(preds, 0).squeeze(1).cpu().numpy()
 
-def permutation_importance(model, X, y, feature_names, batch=8192, repeats=1):
-    y_hat = predict_batches(model, X, batch=batch)
-    base_r2 = r2_score(y.reshape(-1), y_hat)
+    # baseline R^2
+    base_preds = _predict_batches(X)
+    base = r2_score(y.cpu().numpy().reshape(-1), base_preds)
+
     rng = np.random.default_rng(123)
-    deltas = []
-    for j, _ in enumerate(feature_names):
+    imps = []
+    X_np = X.cpu().numpy()
+    for j in range(X.shape[1]):
         scores = []
         for _ in range(repeats):
-            Xp = X.copy()
+            Xp = X_np.copy()
             rng.shuffle(Xp[:, j])
-            y_perm = predict_batches(model, Xp, batch=batch)
-            scores.append(base_r2 - r2_score(y.reshape(-1), y_perm))
-        deltas.append(float(np.mean(scores)))
-    return dict(zip(feature_names, deltas)), float(base_r2)
+            p = _predict_batches(torch.from_numpy(Xp).to(X.dtype))
+            scores.append(r2_score(y.cpu().numpy().reshape(-1), p))
+        imps.append(base - float(np.mean(scores)))
+    return base, imps
 
-def saliency_attribution(model, X, feature_names, batch=2048):
-    device = torch.device("cpu")
-    model.to(device)
-    grads_sum = np.zeros((X.shape[1],), dtype=np.float64)
-    n = 0
-    for i in range(0, X.shape[0], batch):
-        xb = torch.from_numpy(X[i:i+batch]).to(device)
-        xb.requires_grad_(True)
-        out = model(xb).sum()
-        out.backward()
-        g = xb.grad.detach().cpu().numpy()
-        grads_sum += np.abs(g).mean(axis=0)
-        n += 1
-    grads_mean = grads_sum / max(n, 1)
-    return dict(zip(feature_names, grads_mean.tolist()))
 
-def integrated_gradients(model, X, feature_names, m_steps=32, batch=1024):
-    device = torch.device("cpu")
-    model.to(device)
-    F = X.shape[1]
-    ig_sum = np.zeros((F,), dtype=np.float64)
-    count = 0
-    for i in range(0, X.shape[0], batch):
-        xb_np = X[i:i+batch]
-        xb = torch.from_numpy(xb_np).to(device)
-        total = torch.zeros_like(xb)
-        for k in range(1, m_steps+1):
-            alpha = float(k)/m_steps
-            xk = (alpha * xb).requires_grad_(True)
-            yk = model(xk).sum()
-            yk.backward()
-            total += xk.grad.detach()
-        ig = (xb * total / m_steps).detach().cpu().numpy()
-        ig_sum += np.abs(ig).mean(axis=0)
-        count += 1
-    ig_mean = ig_sum / max(count, 1)
-    return dict(zip(feature_names, ig_mean.tolist()))
+def saliency(model: nn.Module, X: torch.Tensor, batch=2048):
+    model.eval()
+    n = min(len(X), batch)
+    x = X[:n].clone().detach().requires_grad_(True)
+    yhat = model(x).sum()
+    yhat.backward()
+    return x.grad.abs().mean(dim=0).cpu().numpy()
 
-# ---------------------------
-# Plot helpers
-# ---------------------------
 
-def barplot(savepath, scores_dict, title):
-    names = list(scores_dict.keys())
-    vals = np.array([scores_dict[n] for n in names], dtype=float)
-    order = np.argsort(vals)[::-1]
-    names = [names[i] for i in order]
-    vals = vals[order]
-    plt.figure(figsize=(8,4.5))
-    plt.bar(names, vals)
+def integrated_gradients(model: nn.Module, X: torch.Tensor, steps=32, batch=2048):
+    model.eval()
+    n = min(len(X), batch)
+    x = X[:n].clone().detach()
+    baseline = torch.zeros_like(x)
+    total = torch.zeros(x.shape[1], dtype=x.dtype)
+    for alpha in torch.linspace(0, 1, steps):
+        xi = baseline + alpha * (x - baseline)
+        xi.requires_grad_(True)
+        yi = model(xi).sum()
+        yi.backward()
+        total += xi.grad.abs().mean(dim=0).detach()
+    return (total / steps).cpu().numpy()
+
+
+# ----------------------------
+# Plotting
+# ----------------------------
+def bar_plot(values: List[float], names: List[str], title: str, path: str):
+    order = np.argsort(values)[::-1]
+    vals = np.array(values)[order]
+    labs = [names[i] for i in order]
+    plt.figure(figsize=(8, 4))
+    plt.bar(range(len(vals)), vals)
+    plt.xticks(range(len(vals)), labs, rotation=45, ha='right')
     plt.title(title)
-    plt.ylabel("Importance / Attribution")
-    plt.xticks(rotation=30, ha="right")
     plt.tight_layout()
-    os.makedirs(os.path.dirname(savepath), exist_ok=True)
-    plt.savefig(savepath, dpi=160)
+    plt.savefig(path, dpi=140)
     plt.close()
 
-# ---------------------------
-# Main
-# ---------------------------
 
+# ----------------------------
+# Main
+# ----------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data_dir", required=True)
-    ap.add_argument("--model_path", default="outputs/elastoplastic/model.pt")
-    ap.add_argument("--out_dir", default="outputs/elastoplastic")
-    ap.add_argument("--standardize", action="store_true")
-    ap.add_argument("--max_files", type=int, default=200)
-    ap.add_argument("--limit", type=int, default=200000)
-    ap.add_argument("--batch", type=int, default=4096)
-    ap.add_argument("--permutation_repeats", type=int, default=1)
+    ap.add_argument('--data_dir', required=True)
+    ap.add_argument('--model_path', default='outputs/elastoplastic/model.pt')
+    ap.add_argument('--out_dir', default='outputs/elastoplastic')
+    ap.add_argument('--standardize', action='store_true')
+    ap.add_argument('--max_files', type=int, default=200)
+    ap.add_argument('--limit', type=int, default=200000)
+    ap.add_argument('--batch', type=int, default=4096)
+    ap.add_argument('--permutation_repeats', type=int, default=3)
+    # v2-compatible flags
+    ap.add_argument('--use_params', action='store_true')
+    ap.add_argument('--target_delta', action='store_true')
     args = ap.parse_args()
 
-    val_dir = os.path.join(args.data_dir, "INPUTS", "npy")
-    files = sorted(glob.glob(os.path.join(val_dir, "sample_*.npy")))
-    if not files:
-        raise FileNotFoundError(f"No npy samples found at {val_dir}")
-
-    ds = ElastoExplainDS(files[:args.max_files], standardize=args.standardize, limit=args.limit)
-    if len(ds) == 0:
-        raise RuntimeError("Dataset is empty after loading. Check file contents.")
-    X = ds.X
-    y = ds.Y.reshape(-1)
-    feat_names = ds.feature_names
-
-    model = try_load_model(args.model_path)
-
-    # If model expects fewer features, trim X (and names) from the right.
-    # We infer expected in_dim from first Linear in model.net
-    first_linear = None
-    for m in model.modules():
-        if isinstance(m, nn.Linear):
-            first_linear = m
-            break
-    if first_linear is None:
-        raise RuntimeError("No Linear layer found in loaded model.")
-    need = first_linear.in_features
-    have = X.shape[1]
-    if have < need:
-        raise RuntimeError(f"Model expects {need} features, but dataset built {have}.")
-    if have > need:
-        X = X[:, :need]
-        feat_names = feat_names[:need]
-
-    # ----------------- Permutation importance -----------------
-    perm, base_r2 = permutation_importance(
-        model, X, y, feat_names,
-        batch=args.batch,
-        repeats=args.permutation_repeats
-    )
     os.makedirs(args.out_dir, exist_ok=True)
-    barplot(os.path.join(args.out_dir, "explain_permutation.png"),
-            perm, f"Permutation importance (ΔR²), base R²={base_r2:.4f}")
 
-    # ----------------- Saliency -----------------
-    sal = saliency_attribution(model, X, feat_names, batch=max(1, args.batch//4))
-    barplot(os.path.join(args.out_dir, "explain_saliency.png"),
-            sal, "Saliency (mean |∂y/∂x|)")
+    # Load & (optionally) standardize inputs
+    X_np, y_np, feat_names = load_dataset(
+        args.data_dir, args.max_files, args.limit,
+        args.use_params, args.target_delta
+    )
 
-    # ----------------- Integrated Gradients -----------------
-    ig = integrated_gradients(model, X, feat_names, m_steps=32, batch=max(1, args.batch//4))
-    barplot(os.path.join(args.out_dir, "explain_integrated_gradients.png"),
-            ig, "Integrated Gradients (mean |IG|)")
+    stats = {}
+    if args.standardize:
+        mean, std = standardize_fit(X_np)
+        X_np = standardize_apply(X_np, mean, std)
+        stats['x_mean'] = mean.tolist()
+        stats['x_std']  = std.tolist()
 
-    # Save JSON summary
+    X = torch.from_numpy(X_np)
+    y = torch.from_numpy(y_np.reshape(-1))
+
+    # Load model (agnostic to 'net.' / 'module.' prefixes)
+    model = try_load_model(args.model_path).eval()
+
+    # Warm-up call to ensure shapes are fine
+    with torch.no_grad():
+        _ = model(X[:2])
+
+    # Base R^2
+    with torch.no_grad():
+        preds = []
+        for i in range(0, len(X), args.batch):
+            preds.append(model(X[i:i+args.batch]))
+        yhat = torch.cat(preds, 0).squeeze(1)
+    base_r2 = r2_score(y.cpu().numpy(), yhat.cpu().numpy())
+
+    # Permutation, saliency, IG
+    base_r2_perm, imps = perm_importance(model, X, y, repeats=args.permutation_repeats, batch=args.batch)
+    sal = saliency(model, X, batch=args.batch)
+    ig  = integrated_gradients(model, X, steps=32, batch=args.batch)
+
+    # Plots
+    bar_plot(imps, feat_names, 'Permutation Importance', os.path.join(args.out_dir, 'explain_permutation.png'))
+    bar_plot(sal.tolist(), feat_names, 'Saliency (|∂y/∂x| avg)', os.path.join(args.out_dir, 'explain_saliency.png'))
+    bar_plot(ig.tolist(),  feat_names, 'Integrated Gradients (avg |grad|)', os.path.join(args.out_dir, 'explain_integrated_gradients.png'))
+
+    # Summary JSON
     summary = {
-        "feature_names": feat_names,
-        "base_r2": float(base_r2),
-        "permutation_importance": {k: float(v) for k, v in perm.items()},
-        "saliency_absgrad": {k: float(v) for k, v in sal.items()},
-        "integrated_gradients": {k: float(v) for k, v in ig.items()},
-        "standardize": bool(args.standardize),
-        "samples_used": int(X.shape[0]),
+        'feature_names': feat_names,
+        'base_r2': float(base_r2),
+        'base_r2_perm_call': float(base_r2_perm),
+        'permutation_importance': {k: float(v) for k, v in zip(feat_names, imps)},
+        'saliency': {k: float(v) for k, v in zip(feat_names, sal.tolist())},
+        'integrated_gradients': {k: float(v) for k, v in zip(feat_names, ig.tolist())},
+        'standardized': bool(args.standardize),
+        'use_params': bool(args.use_params),
+        'target_delta': bool(args.target_delta),
+        'n_samples': int(len(X_np))
     }
-    with open(os.path.join(args.out_dir, "explain_summary.json"), "w") as f:
+    with open(os.path.join(args.out_dir, 'explain_summary.json'), 'w') as f:
         json.dump(summary, f, indent=2)
 
-    print("[Explain] Saved:")
-    print(" ", os.path.join(args.out_dir, "explain_permutation.png"))
-    print(" ", os.path.join(args.out_dir, "explain_saliency.png"))
-    print(" ", os.path.join(args.out_dir, "explain_integrated_gradients.png"))
-    print(" ", os.path.join(args.out_dir, "explain_summary.json"))
+    print('[Explain] Saved:')
+    print(' ', os.path.join(args.out_dir, 'explain_permutation.png'))
+    print(' ', os.path.join(args.out_dir, 'explain_saliency.png'))
+    print(' ', os.path.join(args.out_dir, 'explain_integrated_gradients.png'))
+    print(' ', os.path.join(args.out_dir, 'explain_summary.json'))
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()

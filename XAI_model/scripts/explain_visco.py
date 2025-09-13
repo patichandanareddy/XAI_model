@@ -1,6 +1,5 @@
-# scripts/explain_visco.py
-import argparse, os, json, glob
-from typing import List, Tuple, Dict
+import os, json, glob, argparse
+from typing import List, Dict, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
@@ -8,17 +7,9 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from sklearn.metrics import r2_score
 
-# Preferred feature keys for typical viscoelastic data.
-# We will only use keys that actually exist in each npy dict.
-PREFERRED_FEATURES = [
-    "strain", "prev_strain", "prev_stress",
-    "e_visco", "prev_e_visco",
-    "control", "time_step", "rate"
-]
-
-# Common parameter keys (if present); we’ll include them with --use_params
-PREFERRED_PARAMS = ["E", "eta", "H_kin", "sig0"]
-
+# ---------------------------
+# Data + features
+# ---------------------------
 def load_one_npy(path: str) -> dict:
     d = np.load(path, allow_pickle=True)
     if isinstance(d, np.ndarray) and d.shape == ():
@@ -27,69 +18,40 @@ def load_one_npy(path: str) -> dict:
         d = dict(d.items())
     return d
 
-def pick_feature_keys(d: dict, use_params: bool) -> List[str]:
-    keys = [k for k in PREFERRED_FEATURES if k in d]
-    if use_params:
-        keys += [k for k in PREFERRED_PARAMS if k in d]
-    # If nothing matched, fallback to all 1D numeric arrays except stress-like targets
-    if not keys:
-        for k, v in d.items():
-            if k.lower() in ("stress", "delta_stress", "target"):
-                continue
-            if isinstance(v, (list, tuple, np.ndarray)):
-                v = np.asarray(v)
-                if v.ndim == 1 and np.issubdtype(v.dtype, np.number):
-                    keys.append(k)
-    return keys
+def build_xy(d: dict, feature_names: List[str], target_delta: bool) -> Tuple[np.ndarray, np.ndarray]:
+    if "strain" not in d:
+        raise KeyError(f"'strain' not in sample keys: {list(d.keys())}")
+    N = len(d["strain"])
+    cols = []
+    for k in feature_names:
+        if k not in d:
+            # If a feature is missing for a particular file, fill with zeros of correct length
+            v = np.zeros((N,), dtype=np.float32)
+        else:
+            v = d[k]
+            if np.ndim(v) == 0:
+                v = np.full((N,), float(v))
+        cols.append(np.asarray(v, dtype=np.float32).reshape(-1,1))
+    X = np.concatenate(cols, axis=1).astype(np.float32)
 
-def build_xy(d: dict, feat_keys: List[str], target_delta: bool):
-    N = len(d[feat_keys[0]]) if feat_keys else len(d["strain"])
-    X_cols = []
-    for k in feat_keys:
-        v = d[k]
-        v = np.asarray(v)
-        if v.ndim == 0:
-            v = np.full((N,), float(v))
-        X_cols.append(v.reshape(-1, 1).astype(np.float32))
-    X = np.concatenate(X_cols, axis=1).astype(np.float32)
-
-    # y target
-    if "stress" in d:
-        y = np.asarray(d["stress"], dtype=np.float32).reshape(-1, 1)
-    elif "target" in d:
-        y = np.asarray(d["target"], dtype=np.float32).reshape(-1, 1)
-    else:
-        raise KeyError("Could not find 'stress' or 'target' in npy file.")
-
-    if target_delta:
-        # subtract previous stress if available
-        if "prev_stress" in d:
-            y = y - np.asarray(d["prev_stress"], dtype=np.float32).reshape(-1, 1)
-        elif "delta_stress" in d:
-            y = np.asarray(d["delta_stress"], dtype=np.float32).reshape(-1, 1)
-        # else we’ll just keep y as-is
-
+    y = np.asarray(d["stress"], dtype=np.float32).reshape(-1,1)
+    if target_delta and "prev_stress" in d:
+        y = y - np.asarray(d["prev_stress"], dtype=np.float32).reshape(-1,1)
     return X, y
 
-def load_dataset(data_dir: str, max_files: int, limit: int, use_params: bool, target_delta: bool):
+def load_dataset(data_dir: str, feature_names: List[str], max_files: int=None, limit: int=None,
+                 target_delta: bool=True, standardize: bool=False):
     files = sorted(glob.glob(os.path.join(data_dir, "INPUTS", "npy", "sample_*.npy")))
     if not files:
-        raise FileNotFoundError(f"No files at {data_dir}/INPUTS/npy/sample_*.npy")
-    if max_files is not None:
+        raise FileNotFoundError(f"No files under {data_dir}/INPUTS/npy/sample_*.npy")
+    if max_files:
         files = files[:max_files]
 
     Xs, Ys = [], []
-    feat_names = None
     total = 0
     for f in tqdm(files, desc="[Load]"):
         d = load_one_npy(f)
-        feats = pick_feature_keys(d, use_params)
-        if not feats:
-            # skip if truly nothing to use
-            continue
-        X, y = build_xy(d, feats, target_delta)
-        if feat_names is None:
-            feat_names = feats
+        X, y = build_xy(d, feature_names, target_delta=target_delta)
         Xs.append(X); Ys.append(y)
         total += len(X)
         if limit is not None and total >= limit:
@@ -97,52 +59,73 @@ def load_dataset(data_dir: str, max_files: int, limit: int, use_params: bool, ta
 
     X = np.concatenate(Xs, axis=0)
     y = np.concatenate(Ys, axis=0)
+
     if limit is not None and len(X) > limit:
         X = X[:limit]; y = y[:limit]
-    return X, y, feat_names
 
-def standardize_fit(X: np.ndarray):
-    mean = X.mean(axis=0, keepdims=True)
-    std = X.std(axis=0, keepdims=True) + 1e-8
-    return mean, std
+    stats = {}
+    if standardize:
+        mean = X.mean(axis=0, keepdims=True)
+        std  = X.std(axis=0, keepdims=True) + 1e-8
+        X = (X - mean)/std
+        stats["x_mean"] = mean.tolist()
+        stats["x_std"]  = std.tolist()
 
-def standardize_apply(X: np.ndarray, mean: np.ndarray, std: np.ndarray):
-    return (X - mean) / std
+    return torch.from_numpy(X), torch.from_numpy(y.reshape(-1)), stats
 
-def strip_prefix_state_dict(sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    # handle both "net.X.weight" and plain "X.weight"
-    new_sd = {}
-    for k, v in sd.items():
-        if k.startswith("net."):
-            new_sd[k[4:]] = v
-        else:
-            new_sd[k] = v
-    return new_sd
-
+# ---------------------------
+# Model loading
+# ---------------------------
 def infer_mlp_from_state_dict(sd: Dict[str, torch.Tensor]) -> nn.Module:
-    sd = strip_prefix_state_dict(sd)
+    # accept both "net.*" and plain indices ("0.weight")
+    key_map = {}
+    for k in list(sd.keys()):
+        if k.startswith("net."):
+            key_map[k.replace("net.", "")] = sd.pop(k)
+        else:
+            key_map[k] = sd.pop(k)
+    sd = key_map  # now keys like "0.weight", "2.bias", etc.
+
     items = [(k, v) for k, v in sd.items() if k.endswith(".weight") and v.ndim == 2]
     if not items:
         raise RuntimeError("No linear weights in state_dict.")
-    # sort by integer index in keys "0.weight", "2.weight"...
+
     def idx_of(name):
-        parts = name.split(".")
-        for p in parts:
-            if p.isdigit():
-                return int(p)
-        return 9999
+        # "0.weight" -> 0 , "2.weight" -> 2, etc.
+        try:
+            return int(name.split(".")[0])
+        except:
+            return 9999
+
     items.sort(key=lambda kv: idx_of(kv[0]))
     shapes = [t.shape for _, t in items]
     in_dim = shapes[0][1]
     hidden = [s[0] for s in shapes[:-1]]
     out_dim = shapes[-1][0]
-    layers, cur_in = [], in_dim
+
+    layers = []
+    cur = in_dim
     for h in hidden:
-        layers += [nn.Linear(cur_in, h), nn.ReLU()]
-        cur_in = h
-    layers += [nn.Linear(cur_in, out_dim)]
+        layers += [nn.Linear(cur, h), nn.ReLU()]
+        cur = h
+    layers += [nn.Linear(cur, out_dim)]
     model = nn.Sequential(*layers)
-    model.load_state_dict(sd, strict=False)
+
+    # rebuild a clean state_dict with new names "0.weight", etc.
+    clean = {}
+    for k, v in items:
+        base = k.split(".")[0]
+        clean[f"{base}.weight"] = v
+        bkey = f"{base}.bias"
+        if bkey in sd:
+            clean[bkey] = sd[bkey]
+    # also include the final output layer bias if present
+    last_idx = max([idx_of(k) for k in clean.keys()])
+    out_b = f"{last_idx}.bias"
+    if out_b in sd:
+        clean[out_b] = sd[out_b]
+
+    model.load_state_dict(clean, strict=False)
     return model
 
 def try_load_model(path: str) -> nn.Module:
@@ -152,38 +135,44 @@ def try_load_model(path: str) -> nn.Module:
     elif isinstance(obj, dict):
         sd = obj
     else:
-        raise RuntimeError("Unsupported checkpoint format.")
-    return infer_mlp_from_state_dict(sd)
+        raise RuntimeError("Unsupported checkpoint format")
+    return infer_mlp_from_state_dict(sd).eval()
 
+# ---------------------------
+# XAI
+# ---------------------------
 @torch.no_grad()
 def perm_importance(model: nn.Module, X: torch.Tensor, y: torch.Tensor, repeats=3, batch=4096):
     model.eval()
-    def _pred(Xt):
-        preds = []
-        for i in range(0, len(Xt), batch):
-            preds.append(model(Xt[i:i+batch]))
-        return torch.cat(preds, 0).squeeze(1)
-    base = r2_score(y.cpu().numpy().reshape(-1), _pred(X).cpu().numpy().reshape(-1))
+    def _preds(xb):
+        out = []
+        for i in range(0, len(xb), batch):
+            out.append(model(xb[i:i+batch]))
+        return torch.cat(out, 0)
+
+    base = r2_score(y.cpu().numpy(), _preds(X).cpu().numpy().reshape(-1))
     rng = np.random.default_rng(123)
-    imps = []
     X_np = X.cpu().numpy()
+    imps = []
     for j in range(X.shape[1]):
         scores = []
         for _ in range(repeats):
             Xp = X_np.copy()
             rng.shuffle(Xp[:, j])
-            pr = _pred(torch.from_numpy(Xp).to(X.dtype))
-            scores.append(r2_score(y.cpu().numpy().reshape(-1), pr.cpu().numpy().reshape(-1)))
+            yp = _preds(torch.from_numpy(Xp).to(X.dtype)).cpu().numpy().reshape(-1)
+            scores.append(r2_score(y.cpu().numpy(), yp))
         imps.append(base - float(np.mean(scores)))
     return base, imps
 
 def saliency(model: nn.Module, X: torch.Tensor, batch=2048):
     model.eval()
     n = min(len(X), batch)
-    x = X[:n].clone().detach().requires_grad_(True)
+    x = X[:n].clone().detach()
+    x.requires_grad_(True)
     yhat = model(x).sum()
     yhat.backward()
-    return x.grad.abs().mean(dim=0).cpu().numpy()
+    g = x.grad.abs().mean(dim=0).detach().cpu().numpy()
+    return g
 
 def integrated_gradients(model: nn.Module, X: torch.Tensor, steps=32, batch=2048):
     model.eval()
@@ -192,17 +181,18 @@ def integrated_gradients(model: nn.Module, X: torch.Tensor, steps=32, batch=2048
     baseline = torch.zeros_like(x)
     total = torch.zeros(x.shape[1], dtype=x.dtype)
     for alpha in torch.linspace(0, 1, steps):
-        xi = (baseline + alpha * (x - baseline)).requires_grad_(True)
+        xi = baseline + alpha*(x - baseline)
+        xi.requires_grad_(True)
         yi = model(xi).sum()
         yi.backward()
         total += xi.grad.abs().mean(dim=0).detach()
-    return (total / steps).cpu().numpy()
+    return (total/steps).cpu().numpy()
 
 def bar_plot(values: List[float], names: List[str], title: str, path: str):
     order = np.argsort(values)[::-1]
     vals = np.array(values)[order]
     labs = [names[i] for i in order]
-    plt.figure(figsize=(8, 4))
+    plt.figure(figsize=(8,4))
     plt.bar(range(len(vals)), vals)
     plt.xticks(range(len(vals)), labs, rotation=45, ha="right")
     plt.title(title)
@@ -210,6 +200,9 @@ def bar_plot(values: List[float], names: List[str], title: str, path: str):
     plt.savefig(path, dpi=140)
     plt.close()
 
+# ---------------------------
+# Main
+# ---------------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", required=True)
@@ -220,65 +213,69 @@ def main():
     ap.add_argument("--limit", type=int, default=300000)
     ap.add_argument("--batch", type=int, default=4096)
     ap.add_argument("--permutation_repeats", type=int, default=3)
-    ap.add_argument("--use_params", action="store_true")
-    ap.add_argument("--target_delta", action="store_true")
+    ap.add_argument("--features_json", default="outputs/viscoelastic_v2/used_features.json",
+                    help="Path to feature list saved by training (used_features.json).")
+    ap.add_argument("--target_delta", action="store_true", help="Use Δstress target (match training).")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
 
-    X_np, y_np, feat_names = load_dataset(
-        args.data_dir, args.max_files, args.limit, args.use_params, args.target_delta
+    # Load the exact features used by training
+    if not os.path.exists(args.features_json):
+        raise FileNotFoundError(f"Missing {args.features_json}. Train first to create it.")
+    feat_names = json.load(open(args.features_json))
+    if not isinstance(feat_names, list) or not feat_names:
+        raise RuntimeError("Invalid feature list in used_features.json")
+
+    # Data
+    X, y, stats = load_dataset(
+        args.data_dir, feat_names,
+        max_files=args.max_files, limit=args.limit,
+        target_delta=args.target_delta, standardize=args.standardize
     )
-    if feat_names is None:
-        raise RuntimeError("Could not infer feature names from data.")
 
-    stats = {}
-    if args.standardize:
-        mean, std = standardize_fit(X_np)
-        X_np = standardize_apply(X_np, mean, std)
-        stats["x_mean"] = mean.tolist()
-        stats["x_std"] = std.tolist()
-
-    X = torch.from_numpy(X_np)
-    y = torch.from_numpy(y_np.reshape(-1))
-
+    # Model
     model = try_load_model(args.model_path).eval()
-    _ = model(X[:2])  # warm up
-
+    # quick forward to ensure shape compatibility
     with torch.no_grad():
-        preds = []
+        _ = model(X[:2])
+
+    # Metrics + XAI
+    with torch.no_grad():
+        yhat = []
         for i in range(0, len(X), args.batch):
-            preds.append(model(X[i:i+args.batch]))
-        yhat = torch.cat(preds, 0).squeeze(1)
+            yhat.append(model(X[i:i+args.batch]))
+        yhat = torch.cat(yhat, 0).squeeze(1)
     base_r2 = r2_score(y.cpu().numpy(), yhat.cpu().numpy())
 
     base_r2_perm, imps = perm_importance(model, X, y, repeats=args.permutation_repeats, batch=args.batch)
     sal = saliency(model, X, batch=args.batch)
     ig  = integrated_gradients(model, X, steps=32, batch=args.batch)
 
+    # Plots
     bar_plot(imps, feat_names, "Permutation Importance", os.path.join(args.out_dir, "explain_permutation.png"))
     bar_plot(sal.tolist(), feat_names, "Saliency (|∂y/∂x| avg)", os.path.join(args.out_dir, "explain_saliency.png"))
-    bar_plot(ig.tolist(),  feat_names, "Integrated Gradients (avg |grad|)", os.path.join(args.out_dir, "explain_integrated_gradients.png"))
+    bar_plot(ig.tolist(), feat_names, "Integrated Gradients (avg |grad|)", os.path.join(args.out_dir, "explain_integrated_gradients.png"))
 
+    # Summary
     summary = {
         "feature_names": feat_names,
         "base_r2": float(base_r2),
+        "base_r2_perm_call": float(base_r2_perm),
         "permutation_importance": {k: float(v) for k, v in zip(feat_names, imps)},
         "saliency": {k: float(v) for k, v in zip(feat_names, sal.tolist())},
         "integrated_gradients": {k: float(v) for k, v in zip(feat_names, ig.tolist())},
         "standardized": bool(args.standardize),
-        "use_params": bool(args.use_params),
         "target_delta": bool(args.target_delta),
-        "n_samples": int(len(X_np))
+        "n_samples": int(len(X)),
+        "x_stats": stats,
     }
     with open(os.path.join(args.out_dir, "explain_summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
 
     print("[Explain] Saved:")
-    print(" ", os.path.join(args.out_dir, "explain_permutation.png"))
-    print(" ", os.path.join(args.out_dir, "explain_saliency.png"))
-    print(" ", os.path.join(args.out_dir, "explain_integrated_gradients.png"))
-    print(" ", os.path.join(args.out_dir, "explain_summary.json"))
+    for k in ["explain_permutation.png","explain_saliency.png","explain_integrated_gradients.png","explain_summary.json"]:
+        print(" ", os.path.join(args.out_dir, k))
 
 if __name__ == "__main__":
     main()
